@@ -81,126 +81,131 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
 
   // Setup Vercel AI SDK DataStream
   const stream = createDataStream(); // Correct way to initialize
-  // const encoder = new TextEncoder(); // Not needed if using stream.append()
-
-  // --- Workflow Management IIFE ---
-  (async () => {
-    let workflowManager: WorkflowManager | null = null;
-    let currentWorkflowId: string | null = incomingWorkflowId || null;
-    let isNewWorkflow = false;
-
+  try { // Outer try block begins here
+    // Initialize LLMManager (should be robust to missing env vars if handled by LLMManager)
+    const llmManager = LLMManager.getInstance(context.cloudflare?.env as Record<string, string> || {});
+    
+    // WebContainer and Shell Setup (Graceful handling)
+    let webcontainerPromise: Promise<WebContainer> | undefined;
+    let shellTerminalGetter: (() => BoltShell) | undefined; // Remains undefined for server-side
     try {
-      if (currentWorkflowId) {
-        logger.info(`api.chat: Attempting to load workflow: ${currentWorkflowId}`);
-        workflowManager = await WorkflowManager.load(currentWorkflowId, llmManager, webcontainerPromise, shellTerminalGetter);
-        if (workflowManager) {
-          logger.info(`api.chat: Loaded existing workflow: ${currentWorkflowId}`);
-          // Register agents for the loaded workflow instance
+        const wcEngine = WebContainerEngine.getInstance();
+        if (wcEngine) {
+            webcontainerPromise = wcEngine.getWebContainer();
+            logger.info("api.chat: WebContainerEngine accessed. ActionRunner capabilities depend on successful promise resolution.");
+        } else {
+            logger.warn("api.chat: WebContainerEngine.getInstance() returned undefined. ActionRunner will be limited (no WebContainer access).");
+        }
+    } catch (e: any) { // Catch any error during instantiation or method call
+        logger.warn(`api.chat: Failed to initialize WebContainerEngine or getShellTerminal. ActionRunner functionality will be limited. Error: ${e.message}`, e);
+    }
+
+    // Setup Vercel AI SDK DataStream
+    const stream = createDataStream();
+
+    // --- Workflow Management IIFE ---
+    (async () => {
+      let workflowManager: WorkflowManager | null = null;
+      let currentWorkflowId: string | null = incomingWorkflowId || null;
+      let isNewWorkflow = false;
+
+      try {
+        if (currentWorkflowId) {
+          logger.info(`api.chat: Attempting to load workflow: ${currentWorkflowId}`);
+          workflowManager = await WorkflowManager.load(currentWorkflowId, llmManager, webcontainerPromise, shellTerminalGetter);
+          if (workflowManager) {
+            logger.info(`api.chat: Loaded existing workflow: ${currentWorkflowId}`);
+            workflowManager.registerAgent(new PlanningAgent(llmManager));
+            workflowManager.registerAgent(new FileAgent());
+            workflowManager.registerAgent(new CodeAgent(llmManager));
+          } else {
+            logger.warn(`api.chat: Workflow ${currentWorkflowId} not found. Starting a new one.`);
+            currentWorkflowId = null; 
+          }
+        }
+
+        if (!workflowManager) {
+          isNewWorkflow = true;
+          logger.info("api.chat: Starting a new workflow.");
+          workflowManager = new WorkflowManager(currentUserMessageContent, llmManager, webcontainerPromise, shellTerminalGetter);
+          currentWorkflowId = workflowManager.getWorkflowState().workflowId;
+          
           workflowManager.registerAgent(new PlanningAgent(llmManager));
           workflowManager.registerAgent(new FileAgent());
           workflowManager.registerAgent(new CodeAgent(llmManager));
-        } else {
-          logger.warn(`api.chat: Workflow ${currentWorkflowId} not found. Starting a new one.`);
-          currentWorkflowId = null; // Force new workflow creation
+
+          stream.experimental_appendMessageAnnotation({ type: 'workflowInit', workflowId: currentWorkflowId });
+          logger.info(`api.chat: New workflow ${currentWorkflowId} initialized and ID sent to client.`);
         }
-      }
-
-      if (!workflowManager) {
-        isNewWorkflow = true;
-        logger.info("api.chat: Starting a new workflow.");
-        // Pass currentUserMessageContent for new workflow initialization
-        workflowManager = new WorkflowManager(currentUserMessageContent, llmManager, webcontainerPromise, shellTerminalGetter);
-        currentWorkflowId = workflowManager.getWorkflowState().workflowId;
         
-        // Register agents for the new workflow instance
-        workflowManager.registerAgent(new PlanningAgent(llmManager));
-        workflowManager.registerAgent(new FileAgent());
-        workflowManager.registerAgent(new CodeAgent(llmManager));
+        if (isNewWorkflow) {
+          stream.experimental_appendMessageAnnotation({ type: 'workflowStatus', status: 'planning', workflowId: currentWorkflowId });
+          logger.debug(`api.chat: [${currentWorkflowId}] Planning new workflow.`);
+          await workflowManager.plan();
+          stream.experimental_appendMessageAnnotation({ type: 'workflowStatus', status: 'planningComplete', plan: workflowManager.getWorkflowState().tasks, workflowId: currentWorkflowId });
+          logger.debug(`api.chat: [${currentWorkflowId}] Planning complete.`);
+          
+          stream.experimental_appendMessageAnnotation({ type: 'workflowStatus', status: 'executing', workflowId: currentWorkflowId });
+          logger.debug(`api.chat: [${currentWorkflowId}] Executing workflow.`);
+          await workflowManager.executeWorkflow();
+          logger.debug(`api.chat: [${currentWorkflowId}] Execution finished.`);
 
-        // Send the new workflow ID to the client
-        stream.experimental_appendMessageAnnotation({ type: 'workflowInit', workflowId: currentWorkflowId });
-        logger.info(`api.chat: New workflow ${currentWorkflowId} initialized and ID sent to client.`);
+        } else if (workflowManager) { // Ensure workflowManager is not null for existing workflows
+          stream.experimental_appendMessageAnnotation({ type: 'workflowStatus', status: 'processingTurn', userInput: currentUserMessageContent, workflowId: currentWorkflowId });
+          logger.debug(`api.chat: [${currentWorkflowId}] Processing turn with input: "${currentUserMessageContent.substring(0,100)}..."`);
+          
+          // Call processTurn for existing, loaded workflows
+          await workflowManager.processTurn(currentUserMessageContent); 
+          // logger.warn(`api.chat: [${currentWorkflowId}] processTurn method is not yet implemented in WorkflowManager. Current user message was: "${currentUserMessageContent}"`);
+          // stream.append("Placeholder: Multi-turn processing not yet fully implemented in WorkflowManager.processTurn. Sending back a simple acknowledgement.\n");
+        }
+
+
+        const finalState = workflowManager.getWorkflowState();
+        logger.info(`api.chat: [${currentWorkflowId}] Workflow ended turn with status: ${finalState.status}`);
+        if (finalState.status === 'completed') {
+          stream.experimental_appendMessageAnnotation({ type: 'workflowStatus', status: 'workflowCompleted', finalState, workflowId: currentWorkflowId });
+          stream.append("Workflow completed successfully.");
+        } else if (finalState.status === 'failed') {
+          stream.experimental_appendMessageAnnotation({ type: 'workflowStatus', status: 'workflowFailed', finalState, workflowId: currentWorkflowId });
+          stream.append(`Workflow failed: ${finalState.tasks.find(t => t.status === 'failed')?.error || 'Unknown error'}`);
+        } else { 
+           stream.experimental_appendMessageAnnotation({ type: 'workflowStatus', status: 'workflowPaused', finalState, workflowId: currentWorkflowId });
+           stream.append("Workflow is now paused, awaiting next input or action.");
+        }
+
+      } catch (error: any) {
+        logger.error(`api.chat: Error during workflow lifecycle in stream (Workflow ID: ${currentWorkflowId || 'N/A'}):`, error);
+        try {
+          stream.experimental_appendMessageAnnotation({ 
+              type: 'workflowError', 
+              message: error.message, 
+              stack: error.stack, 
+              workflowId: currentWorkflowId 
+          });
+          stream.append(`Error processing workflow: ${error.message}`); 
+        } catch (streamErr) {
+          logger.error("api.chat: FATAL - Could not send error to stream:", streamErr);
+        }
+      } finally {
+        logger.info(`api.chat: Closing data stream for workflow: ${currentWorkflowId || 'N/A'}.`);
+        stream.close();
       }
-      
-      // Optional: workflowManager.setDataStream(stream); // For more granular updates from manager/agents
+    })(); // End of async IIFE
 
-      if (isNewWorkflow) {
-        stream.experimental_appendMessageAnnotation({ type: 'workflowStatus', status: 'planning', workflowId: currentWorkflowId });
-        logger.debug(`api.chat: [${currentWorkflowId}] Planning new workflow.`);
-        await workflowManager.plan();
-        stream.experimental_appendMessageAnnotation({ type: 'workflowStatus', status: 'planningComplete', plan: workflowManager.getWorkflowState().tasks, workflowId: currentWorkflowId });
-        logger.debug(`api.chat: [${currentWorkflowId}] Planning complete.`);
-        
-        stream.experimental_appendMessageAnnotation({ type: 'workflowStatus', status: 'executing', workflowId: currentWorkflowId });
-        logger.debug(`api.chat: [${currentWorkflowId}] Executing workflow.`);
-        await workflowManager.executeWorkflow();
-        logger.debug(`api.chat: [${currentWorkflowId}] Execution finished.`);
+    // Return the stream response (now inside the main try block)
+    return new Response(stream.readable, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Connection': 'keep-alive',
+        'Cache-Control': 'no-cache',
+      },
+    });
 
-      } else {
-        // For existing workflows, process the new user turn
-        stream.experimental_appendMessageAnnotation({ type: 'workflowStatus', status: 'processingTurn', userInput: currentUserMessageContent, workflowId: currentWorkflowId });
-        logger.debug(`api.chat: [${currentWorkflowId}] Processing turn with input: "${currentUserMessageContent.substring(0,100)}..."`);
-        // TODO: Implement workflowManager.processTurn in WorkflowManager.ts
-        // For now, let's assume processTurn might re-plan or directly execute tasks based on new input.
-        // This is a placeholder for the actual multi-turn logic that needs to be defined in WorkflowManager.
-        // await workflowManager.processTurn(currentUserMessageContent); 
-        stream.append("Placeholder: Multi-turn processing not yet fully implemented in WorkflowManager.processTurn. Sending back a simple acknowledgement.\n");
-        logger.warn(`api.chat: [${currentWorkflowId}] processTurn method is not yet implemented in WorkflowManager. Current user message was: "${currentUserMessageContent}"`);
-        // As a temporary measure, we might just re-execute if there are pending tasks.
-        // Or, if the workflow was paused, this input might trigger new planning or task execution.
-        // For this iteration, we'll just log and let the status be 'paused'.
-      }
-
-      const finalState = workflowManager.getWorkflowState();
-      logger.info(`api.chat: [${currentWorkflowId}] Workflow ended turn with status: ${finalState.status}`);
-      if (finalState.status === 'completed') {
-        stream.experimental_appendMessageAnnotation({ type: 'workflowStatus', status: 'workflowCompleted', finalState, workflowId: currentWorkflowId });
-        stream.append("Workflow completed successfully.");
-      } else if (finalState.status === 'failed') {
-        stream.experimental_appendMessageAnnotation({ type: 'workflowStatus', status: 'workflowFailed', finalState, workflowId: currentWorkflowId });
-        stream.append(`Workflow failed: ${finalState.tasks.find(t => t.status === 'failed')?.error || 'Unknown error'}`);
-      } else { // e.g. 'pending' (after planning), 'running' (if paused mid-execution), or a new 'paused' state
-         stream.experimental_appendMessageAnnotation({ type: 'workflowStatus', status: 'workflowPaused', finalState, workflowId: currentWorkflowId });
-         stream.append("Workflow is now paused, awaiting next input or action.");
-      }
-
-    } catch (error: any) {
-      logger.error(`api.chat: Error during workflow lifecycle in stream (Workflow ID: ${currentWorkflowId || 'N/A'}):`, error);
-      try {
-        // Send a structured error annotation to the client
-        stream.experimental_appendMessageAnnotation({ 
-            type: 'workflowError', 
-            message: error.message, 
-            stack: error.stack, // Be cautious about sending full stacks to client in production
-            workflowId: currentWorkflowId 
-        });
-        stream.append(`Error processing workflow: ${error.message}`); // Also send a human-readable part
-      } catch (streamErr) {
-        logger.error("api.chat: FATAL - Could not send error to stream:", streamErr);
-      }
-    } finally {
-      logger.info(`api.chat: Closing data stream for workflow: ${currentWorkflowId || 'N/A'}.`);
-      stream.close();
-    }
-  })(); // End of async IIFE
-
-  // Return the stream response
-  return new Response(stream.readable, {
-    status: 200,
-    headers: {
-      'Content-Type': 'text/event-stream; charset=utf-8',
-      'Connection': 'keep-alive',
-      'Cache-Control': 'no-cache',
-    },
-  });
-
-  // Outer try-catch for setup errors before stream is returned.
-  // Errors during stream execution are handled within the IIFE.
-  } catch (error: any) {
+  } catch (error: any) { // This catch now correctly pairs with the outer try
     logger.error("api.chat: Outer catch block error (setup phase):", error);
-    // This error occurs before the stream response is established.
-    // Return a plain error response.
-    if (error.message?.includes('API key')) {
+    if (error.message?.includes('API key')) { 
       return new Response('Invalid or missing API key', { status: 401, statusText: 'Unauthorized' });
     }
     return new Response(`Server setup error: ${error.message}`, { status: 500, statusText: 'Internal Server Error' });
