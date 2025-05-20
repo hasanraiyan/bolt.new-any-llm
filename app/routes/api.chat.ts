@@ -156,8 +156,6 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
           
           // Call processTurn for existing, loaded workflows
           await workflowManager.processTurn(currentUserMessageContent); 
-          // logger.warn(`api.chat: [${currentWorkflowId}] processTurn method is not yet implemented in WorkflowManager. Current user message was: "${currentUserMessageContent}"`);
-          // stream.append("Placeholder: Multi-turn processing not yet fully implemented in WorkflowManager.processTurn. Sending back a simple acknowledgement.\n");
         }
 
 
