@@ -40,47 +40,77 @@ export class PlanningAgent implements Agent {
       throw new Error("Original user input is missing in workflowState.");
     }
 
-    // Use task.input.request if available and relevant, otherwise default to originalUserInput
-    // For PlanningAgent, the primary input is typically the overall goal.
-    const planningRequest = (task.input?.request as string) || userInput;
+    const {
+      request, // This would be the initial request for a new plan
+      conversationHistory, // For multi-turn
+      existingTasks // For multi-turn
+    } = task.input as { 
+      request?: string; 
+      conversationHistory?: Array<{role: string, content: string}>;
+      existingTasks?: Task[];
+    };
 
-    const systemPrompt = `You are an expert project planner. Your goal is to break down the user's request into a sequence of actionable tasks.
+    let latestUserRequest = request || "";
+    if (conversationHistory && conversationHistory.length > 0) {
+        const lastUserMsg = conversationHistory.filter(m => m.role === 'user').pop();
+        if (lastUserMsg) latestUserRequest = lastUserMsg.content;
+    }
+    
+    if (!latestUserRequest && !userInput) { // userInput is workflowState.originalUserInput
+        return {
+            status: "failure",
+            error: "PlanningAgent: No user input or planning request provided.",
+            plannedTasks: [],
+        };
+    }
+    // Fallback to originalUserInput if no specific request or history latest found
+    if (!latestUserRequest) latestUserRequest = userInput;
+
+
+    const formattedConvHistory = this.formatConversationHistory(conversationHistory);
+    const formattedExistingTasks = this.formatExistingTasks(existingTasks);
+
+    const systemPrompt = `You are an expert project planner. Your goal is to break down the user's request into a sequence of actionable tasks, considering the ongoing conversation history and any existing, incomplete tasks.
+
+CONVERSATION HISTORY (if any):
+${formattedConvHistory}
+
+EXISTING INCOMPLETE TASKS (if any, these were planned previously but not completed):
+${formattedExistingTasks}
+
+Based on the LATEST user message in the conversation history (or the primary request if no history), provide a NEW list of tasks to achieve the user's latest request. You can choose to continue or modify the previous plan if appropriate, or suggest a new set of tasks.
 Each task should be assigned to one of the following specialized agents:
 - FileAgent: Handles file creation, modification, reading, or deletion.
 - CodeAgent: Handles writing, modifying, or analyzing code within files.
 - ShellAgent: Handles executing shell commands in a terminal.
 - ReviewAgent: Handles reviewing changes, asking clarifying questions, or requesting user approval.
 
-Based on the user's request, provide a numbered list of tasks. Each line must strictly follow the format: "Number. AgentName Action description"
+Strictly follow the format: "Number. AgentName Action description" for each task.
 Example:
-User Request: Create a python script that prints 'Hello World', then run it, and finally list files in the current directory.
-Output:
 1. FileAgent Create a new file named 'main.py'.
 2. CodeAgent Write the following Python code into 'main.py': print('Hello World').
-3. ShellAgent Execute the command 'python main.py'.
-4. ShellAgent List files in the current directory.
 
-User Request: ${planningRequest}
-Output:`;
+LATEST USER REQUEST: ${latestUserRequest}
+Output (NEW list of tasks based on latest request):`;
 
     try {
-      // Assume llmManager is pre-configured or can get a default model
-      // The actual method to get a model might vary (e.g., getDefaultModel, getModel with specific params)
-      const model = this.llmManager.getModel(); // Simplified assumption
+      const model = this.llmManager.getModel();
       if (!model) {
-        throw new Error("LLM model could not be obtained from LLMManager.");
+        console.error("PlanningAgent: LLM model could not be obtained from LLMManager.");
+        return { status: "failure", error: "LLM model not available", plannedTasks: [] };
       }
 
-      console.log(`PlanningAgent: Sending request to LLM for input: "${planningRequest}"`);
+      console.log(`PlanningAgent: Sending request to LLM for input: "${latestUserRequest}"`);
       const llmResponse = await generateText({
         model: model,
         prompt: systemPrompt,
+        // Consider adding parameters like temperature if needed for planning quality
       });
 
       const llmTextOutput = llmResponse.text.trim();
       console.log(`PlanningAgent: Received LLM output:\n${llmTextOutput}`);
 
-      const plannedTasks: Task[] = [];
+      const newPlannedTasks: Task[] = []; // Changed variable name for clarity
       const lines = llmTextOutput.split('\n');
 
       // Regex to parse lines like "1. FileAgent Create a new file named 'script.py'."
@@ -91,38 +121,37 @@ Output:`;
         if (match) {
           const [, agentName, actionDescription] = match;
           const newTask: Task = {
-            id: this.generateId(),
+            id: this.generateId(), // Ensure unique IDs for new tasks
             agentName: agentName.trim(),
             input: { 
               action: actionDescription.trim(),
-              originalUserInput: userInput, // Include original request for context
-              dependencyOutput: {} // To be filled by previous tasks if needed
+              // originalUserInput: userInput, // Retain for context if needed, but primary is latestUserRequest
+              latestUserRequest: latestUserRequest, // Store the request that generated this task
+              // conversationHistory can be large, decide if it needs to be in each task's input
             },
             status: 'pending',
             createdAt: new Date(),
             updatedAt: new Date(),
-            // dependencies will be set by WorkflowManager based on sequence
+            dependencies: [], // Dependencies will be managed by WorkflowManager if multi-step plans are generated
           };
-          plannedTasks.push(newTask);
+          newPlannedTasks.push(newTask);
         } else {
           console.warn(`PlanningAgent: Could not parse task line: "${line}"`);
         }
       }
 
-      if (plannedTasks.length === 0 && llmTextOutput.length > 0) {
-        // This might happen if the LLM doesn't follow the format or if the request is too simple for a multi-task plan.
+      if (newPlannedTasks.length === 0 && llmTextOutput.length > 0) {
         console.warn("PlanningAgent: LLM output was received, but no tasks could be parsed according to the expected format.");
-        // Potentially create a single "fallback" task or let the workflow handle it.
-        // For now, returning an empty list and letting the workflow manager decide.
+        // Optionally, return a specific error or a "clarification" task
       }
       
-      console.log(`PlanningAgent: Successfully planned ${plannedTasks.length} tasks.`);
+      console.log(`PlanningAgent: Successfully planned ${newPlannedTasks.length} new tasks.`);
       return {
         status: "success",
-        plannedTasks: plannedTasks,
+        plannedTasks: newPlannedTasks, // Return the newly generated tasks
         sharedContextUpdates: {
-          rawPlanText: llmTextOutput,
-          plannedTaskObjects: plannedTasks 
+          rawPlanText: llmTextOutput, // Keep raw text for auditing/debugging
+          plannedTaskObjects: newPlannedTasks, // Keep new tasks for auditing/debugging
         }
       };
 
@@ -131,8 +160,20 @@ Output:`;
       return {
         status: "failure",
         error: `PlanningAgent failed to execute: ${error.message}`,
-        plannedTasks: [] // Ensure plannedTasks is always defined, even on failure
+        plannedTasks: []
       };
     }
   }
+
+  private formatConversationHistory(history?: Array<{role: string, content: string}>): string {
+    if (!history || history.length === 0) return "No prior conversation history.";
+    return history.map(msg => `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content}`).join('\n');
+  }
+
+  private formatExistingTasks(tasks?: Task[]): string {
+    if (!tasks || tasks.length === 0) return "No existing incomplete tasks.";
+    return tasks.map(task => `- Task ID: ${task.id}, Agent: ${task.agentName}, Status: ${task.status}, Input: ${JSON.stringify(task.input)}`).join('\n');
+  }
+
+  // getLatestUserRequest is handled within the execute method now.
 }
