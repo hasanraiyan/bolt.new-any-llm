@@ -79,8 +79,6 @@ async function chatAction({ context, request }: ActionFunctionArgs) {
       logger.warn(`api.chat: Failed to initialize WebContainerEngine or getShellTerminal. ActionRunner functionality will be limited. Error: ${e.message}`, e);
   }
 
-  // Setup Vercel AI SDK DataStream
-  const stream = createDataStream(); // Correct way to initialize
   try { // Outer try block begins here
     // Initialize LLMManager (should be robust to missing env vars if handled by LLMManager)
     const llmManager = LLMManager.getInstance(context.cloudflare?.env as Record<string, string> || {});
